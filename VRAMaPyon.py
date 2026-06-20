@@ -1762,16 +1762,35 @@ class VRAMaPyon(ctk.CTk):
         self.refresh()
 
     def _resolve_gpu_labels(self, procs, totals):
-        """luid → (表示名, 並び順位)。VRAM合計最大のluid=メインGPU、ほかは内蔵扱い。
-        順位は「全GPU合計の多い順」で固定＝タグを安定表示するため（多い方だけ出すと毎回入れ替わる）。"""
-        tot = {}
+        """luid → (表示名, 並び順位)。NVIDIA(5070)のluidを特定し、ほかは内蔵扱い。
+
+        ⚠️NVIDIA判定は **実数(Local)合計が nvidia-smi 使用量に最も近いluid** で行う。
+        旧版は「Dedicated(予約)最大のluid＝NVIDIA」だったが、NVIDIA Overlay 等が内蔵側luidに
+        巨大な予約(数十GB)を積むと内蔵をNVIDIAと誤認しラベルが逆転した（Forge=実数5GBが5070
+        なのに「内蔵」表示になる等）。実数はnvidia-smiの物理使用と一致するので、これで騙されない。
+        順位は実数合計の多い順で固定＝タグを安定表示。"""
+        loc = {}    # luid -> Local(実数) 合計
+        ded = {}    # luid -> Dedicated(予約) 合計（フォールバック用）
         for d in procs:
             for a in (d.get("adapters") or []):
-                tot[a.get("luid")] = tot.get(a.get("luid"), 0) + a.get("bytes", 0)
-        tot.pop(None, None)
-        if not tot:
+                lu = a.get("luid")
+                loc[lu] = loc.get(lu, 0) + a.get("lbytes", 0)
+                ded[lu] = ded.get(lu, 0) + a.get("bytes", 0)
+        for tbl in (loc, ded):
+            tbl.pop(None, None)
+        luids = set(loc) | set(ded)
+        if not luids:
             return {}, {}
-        order = sorted(tot, key=tot.get, reverse=True)
+        # NVIDIAのluid＝実数合計が nvidia-smi 使用量に最も近いもの（幽霊予約に騙されない）
+        nv = None
+        if totals and totals.get("used"):
+            target = totals["used"] * 1024 * 1024            # MB → bytes
+            nv = min(luids, key=lambda lu: abs(loc.get(lu, 0) - target))
+        if nv is None:                                       # nvidia-smi無し時は実数最大をメイン扱い
+            nv = max(luids, key=lambda lu: loc.get(lu, 0))
+        rest = sorted((lu for lu in luids if lu != nv),
+                      key=lambda lu: loc.get(lu, 0), reverse=True)
+        order = [nv] + rest
         labels = {order[0]: (short_gpu_name(totals["name"]) if totals else "GPU")}
         for i, lu in enumerate(order[1:]):
             labels[lu] = t("pref_label_igpu") if i == 0 else f"GPU{i + 1}"
